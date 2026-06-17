@@ -7,19 +7,13 @@ Install:
                 torch torchvision huggingface-hub httpx ultralytics
 
 Run:
-    python watermark_api.py
+    python main.py
 
 Endpoints:
     GET  /health      — model status
     POST /remove/url  — JSON { "image_url": "https://..." }
+    GET  /remove/url  — ?image_url=https://... (browser-friendly)
     GET  /docs        — Swagger UI
-
-How it works:
-    1. Download image from URL
-    2. YOLOv8n detects text/logo watermark regions → bounding boxes
-    3. Draw mask from bounding boxes
-    4. LaMa inpaints the masked regions
-    5. Return clean image
 """
 
 # ── stdlib ─────────────────────────────────────────────────────────────────────
@@ -37,7 +31,7 @@ import httpx
 import numpy as np
 import torch
 import torch.nn.functional as F
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, HTMLResponse
 from PIL import Image, ImageDraw, UnidentifiedImageError
@@ -358,6 +352,8 @@ Content-Type: application/json
   "confidence": 0.25,
   "output_format": "PNG"
 }
+
+GET /remove/url?image_url=https://example.com/photo.jpg
       </pre>
       <a href="/docs">→ Interactive docs</a>
     </body></html>
@@ -376,10 +372,51 @@ async def health():
     }
 
 
+# ─── CORE PROCESSING FUNCTION (shared between POST and GET) ────────────────
+
+async def process_watermark_removal(
+    image_url: str,
+    confidence: float,
+    padding: int,
+    output_format: str,
+    background_tasks: BackgroundTasks,
+) -> Response:
+    """Shared logic for both POST and GET endpoints."""
+    # Download image from URL
+    image_bytes = await fetch_url(image_url)
+    try:
+        pil_image = bytes_to_pil(image_bytes)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    log.info("Processing %s | size=%s | conf=%.2f", image_url, pil_image.size, confidence)
+
+    try:
+        out_bytes, n_found = run_pipeline(
+            pil_image,
+            confidence=confidence,
+            padding=padding,
+            output_format=output_format,
+        )
+    except Exception as e:
+        log.error("Pipeline error: %s", e)
+        raise HTTPException(500, f"Processing failed: {e}")
+
+    background_tasks.add_task(gc.collect)
+
+    return Response(
+        content=out_bytes,
+        media_type=MIME[output_format],
+        headers={"X-Watermarks-Found": str(n_found)},
+    )
+
+
+# ─── POST ENDPOINT ──────────────────────────────────────────────────────────
+
 @app.post(
     "/remove/url",
     tags=["Watermark Removal"],
-    summary="Remove watermarks from a hosted image URL",
+    summary="Remove watermarks from a hosted image URL (POST with JSON)",
     response_class=Response,
     responses={
         200: {
@@ -393,55 +430,53 @@ async def health():
         404: {"description": "No watermarks detected"},
     },
 )
-async def remove_from_url(req: RemoveRequest, background_tasks: BackgroundTasks):
-    """
-    The main endpoint. Send any public image URL and get back the watermark-free image.
+async def remove_from_url_post(req: RemoveRequest, background_tasks: BackgroundTasks):
+    """POST version - expects JSON body."""
+    return await process_watermark_removal(
+        image_url=req.image_url,
+        confidence=req.confidence,
+        padding=req.padding,
+        output_format=req.output_format,
+        background_tasks=background_tasks,
+    )
 
-    **Detection model**: `qfisch/yolov8n-watermark-detection` — trained to find
-    text watermarks and logo watermarks specifically.
 
-    **Inpainting model**: LaMa (`smartywu/big-lama`) — fills detected regions
-    with realistic content using the surrounding image context.
+# ─── GET ENDPOINT (NEW!) ────────────────────────────────────────────────────
 
-    **Telegram bot usage**:
-    ```python
-    file = await bot.get_file(message.photo[-1].file_id)
-    tg_url = f"https://api.telegram.org/file/bot{TOKEN}/{file.file_path}"
-    r = httpx.post("http://your-api/remove/url", json={"image_url": tg_url})
-    await message.answer_photo(BufferedInputFile(r.content, "result.png"))
-    ```
-
-    **Tune detection**:
-    - Lower `confidence` (e.g. 0.1) → catches more watermarks, may have false positives
-    - Higher `confidence` (e.g. 0.5) → more precise, may miss faint watermarks
-    - Increase `padding` → expands mask around each detected box (good for soft edges)
-    """
-    # Download image from URL
-    image_bytes = await fetch_url(req.image_url)
-    try:
-        pil_image = bytes_to_pil(image_bytes)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-    log.info("Processing %s | size=%s | conf=%.2f", req.image_url, pil_image.size, req.confidence)
-
-    try:
-        out_bytes, n_found = run_pipeline(
-            pil_image,
-            confidence=req.confidence,
-            padding=req.padding,
-            output_format=req.output_format,
-        )
-    except Exception as e:
-        log.error("Pipeline error: %s", e)
-        raise HTTPException(500, f"Processing failed: {e}")
-
-    background_tasks.add_task(gc.collect)
-
-    return Response(
-        content=out_bytes,
-        media_type=MIME[req.output_format],
-        headers={"X-Watermarks-Found": str(n_found)},
+@app.get(
+    "/remove/url",
+    tags=["Watermark Removal"],
+    summary="Remove watermarks from a hosted image URL (GET with query params)",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"image/png": {}},
+            "description": "Cleaned image with watermarks removed",
+            "headers": {
+                "X-Watermarks-Found": {"description": "Number of watermarks detected"},
+            },
+        },
+        400: {"description": "Bad URL or unreadable image"},
+        404: {"description": "No watermarks detected"},
+    },
+)
+async def remove_from_url_get(
+    image_url: str = Query(..., description="URL of the image to process"),
+    confidence: float = Query(0.25, description="Detection threshold (0.05-0.95)", ge=0.05, le=0.95),
+    padding: int = Query(10, description="Pixels to expand each detected box (0-100)", ge=0, le=100),
+    output_format: str = Query("PNG", description="Output format: PNG, JPEG, or WEBP"),
+    background_tasks: BackgroundTasks = None,
+):
+    """GET version - use with browser. Example: /remove/url?image_url=https://example.com/photo.jpg"""
+    # Validate output_format
+    output_format = fmt_from_str(output_format)
+    
+    return await process_watermark_removal(
+        image_url=image_url,
+        confidence=confidence,
+        padding=padding,
+        output_format=output_format,
+        background_tasks=background_tasks,
     )
 
 
@@ -452,48 +487,9 @@ async def remove_from_url(req: RemoveRequest, background_tasks: BackgroundTasks)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "watermark_api:app",
+        "main:app",  # <-- Now references main.py
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", 8000)),
         reload=False,
         log_level="info",
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM BOT  (save as bot.py, run separately)
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# pip install aiogram httpx
-#
-# import asyncio, os, httpx
-# from aiogram import Bot, Dispatcher, Router, F
-# from aiogram.types import Message, BufferedInputFile
-#
-# BOT_TOKEN = os.environ["BOT_TOKEN"]
-# API_URL   = os.environ.get("API_URL", "http://localhost:8000")
-# bot, dp, router = Bot(BOT_TOKEN), Dispatcher(), Router()
-# dp.include_router(router)
-#
-# @router.message(F.photo)
-# async def handle_photo(message: Message):
-#     await message.reply("🔍 Detecting watermarks…")
-#     file   = await bot.get_file(message.photo[-1].file_id)
-#     tg_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-#     async with httpx.AsyncClient(timeout=120) as client:
-#         r = await client.post(f"{API_URL}/remove/url", json={"image_url": tg_url})
-#     n = r.headers.get("X-Watermarks-Found", "?")
-#     if r.status_code == 200:
-#         await message.answer_photo(
-#             BufferedInputFile(r.content, "clean.png"),
-#             caption=f"✅ Done! {n} watermark(s) removed."
-#         )
-#     else:
-#         await message.reply(f"❌ Error: {r.text}")
-#
-# @router.message(F.text)
-# async def handle_text(msg: Message):
-#     await msg.reply("Send me a photo and I'll remove the watermark! 🖼️")
-#
-# if __name__ == "__main__":
-#     asyncio.run(dp.start_polling(bot))
+        )
