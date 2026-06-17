@@ -1,0 +1,21 @@
+# Core Web Framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Image Processing
+Pillow
+numpy
+
+# Deep Learning (PyTorch)
+torch
+torchvision
+
+# Hugging Face (Model Downloads)
+huggingface-hub
+
+# YOLO (Watermark Detection)
+ultralytics
+
+# HTTP Client (for URL fetching)
+httpx
