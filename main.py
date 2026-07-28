@@ -7,6 +7,7 @@ from typing import Optional
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from huggingface_hub import InferenceClient
 from PIL import Image
@@ -114,7 +115,8 @@ def root():
         "model": MODEL_ID,
         "provider": INFERENCE_PROVIDER,
         "endpoints": {
-            "edit": "POST /edit",
+            "edit_post": "POST /edit  (JSON body: prompt, image_url or image_base64)",
+            "edit_get": "GET /edit?image_url=...&prompt=...  (redirects to result image)",
             "health": "GET /health",
         },
     }
@@ -125,17 +127,17 @@ def health():
     return {"status": "ok", "hf_token_configured": bool(HF_TOKEN)}
 
 
-@app.post("/edit", response_model=EditResponse)
-def edit_image(req: EditRequest, request_base_url: str = ""):
+def run_edit(prompt: str, image_url: Optional[str] = None, image_base64: Optional[str] = None) -> EditResponse:
     if client is None:
         raise HTTPException(
             status_code=500,
             detail="Server is not configured with HF_TOKEN. Set it in the environment.",
         )
 
-    if not req.prompt or not req.prompt.strip():
+    if not prompt or not prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required.")
 
+    req = EditRequest(prompt=prompt, image_url=image_url, image_base64=image_base64)
     img_bytes = load_image_bytes(req)
 
     try:
@@ -147,7 +149,7 @@ def edit_image(req: EditRequest, request_base_url: str = ""):
 
         result = client.image_to_image(
             clean_bytes,
-            prompt=req.prompt.strip(),
+            prompt=prompt.strip(),
             model=MODEL_ID,
         )
     except Exception as e:
@@ -174,6 +176,35 @@ def edit_image(req: EditRequest, request_base_url: str = ""):
         image_base64=f"data:image/png;base64,{b64_out}",
         message="Edit successful. image_url is relative to this API's base URL.",
     )
+
+
+@app.post("/edit", response_model=EditResponse)
+def edit_image_post(req: EditRequest):
+    return run_edit(prompt=req.prompt, image_url=req.image_url, image_base64=req.image_base64)
+
+
+@app.get("/edit")
+def edit_image_get(
+    image_url: str,
+    prompt: str = "enhance and improve this image",
+    redirect: bool = True,
+):
+    """
+    GET-friendly version for pasting directly into a browser or calling from
+    tools that only support simple URL requests, e.g.:
+
+    /edit?image_url=https://example.com/photo.jpg&prompt=remove+the+watermark
+
+    By default this redirects straight to the resulting image (302), so the
+    URL can be dropped directly into an <img src="..."> tag. Pass
+    redirect=false to get the full JSON response instead.
+    """
+    result = run_edit(prompt=prompt, image_url=image_url)
+
+    if redirect:
+        return RedirectResponse(url=result.image_url)
+
+    return result
 
 
 if __name__ == "__main__":
