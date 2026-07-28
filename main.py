@@ -20,6 +20,26 @@ from pydantic import BaseModel, Field
 import huggingface_hub
 print(f"huggingface_hub version: {huggingface_hub.__version__}")
 
+# --- TEMPORARY DIAGNOSTIC PATCH ---
+# Logs the raw fal.ai response before the library tries to parse it, so we can
+# see exactly what came back when the expected "images" key is missing.
+try:
+    from huggingface_hub.inference._providers import fal_ai as _fal_ai_module
+    from huggingface_hub.inference._common import _as_dict as _hf_as_dict
+
+    _original_get_response = _fal_ai_module.FalAIImageToImageTask.get_response
+
+    def _patched_get_response(self, response, request_params=None):
+        output = _fal_ai_module.FalAIQueueTask.get_response(self, response, request_params)
+        print(f"RAW FAL.AI RESPONSE: {_hf_as_dict(output)}")
+        return _original_get_response(self, response, request_params)
+
+    _fal_ai_module.FalAIImageToImageTask.get_response = _patched_get_response
+    print("Diagnostic patch applied to FalAIImageToImageTask.get_response")
+except Exception as _patch_err:
+    print(f"Could not apply diagnostic patch: {_patch_err}")
+# --- END TEMPORARY DIAGNOSTIC PATCH ---
+
 HF_TOKEN = os.environ.get("HF_TOKEN")
 INFERENCE_PROVIDER = os.environ.get("HF_PROVIDER", "fal-ai")  # fal-ai, replicate, etc.
 MODEL_ID = os.environ.get("MODEL_ID", "black-forest-labs/FLUX.2-dev")
