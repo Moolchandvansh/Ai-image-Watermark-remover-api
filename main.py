@@ -153,7 +153,9 @@ def run_edit(prompt: str, image_url: Optional[str] = None, image_base64: Optiona
             model=MODEL_ID,
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Inference provider error: {e}")
+        import traceback
+        print(f"FULL TRACEBACK for image_to_image error:\n{traceback.format_exc()}")
+        raise HTTPException(status_code=502, detail=f"Inference provider error: {type(e).__name__}: {e}")
 
     # result is typically a PIL.Image
     if isinstance(result, Image.Image):
