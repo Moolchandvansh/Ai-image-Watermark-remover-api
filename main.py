@@ -16,6 +16,9 @@ from pydantic import BaseModel, Field
 # Config
 # ---------------------------------------------------------------------------
 
+import huggingface_hub
+print(f"huggingface_hub version: {huggingface_hub.__version__}")
+
 HF_TOKEN = os.environ.get("HF_TOKEN")
 INFERENCE_PROVIDER = os.environ.get("HF_PROVIDER", "fal-ai")  # fal-ai, replicate, etc.
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen-Image-Edit")
